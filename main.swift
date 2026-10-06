@@ -19,10 +19,54 @@ enum SleepService {
         }
     }
 
-    /// Меняет режим через стандартный системный запрос пароля администратора.
+    /// Меняет режим: сначала через sudo без пароля (если правило установлено),
+    /// иначе через стандартный системный запрос пароля администратора.
     static func setDisabled(_ disabled: Bool) -> Bool {
-        let cmd = "/usr/bin/pmset -a disablesleep \(disabled ? 1 : 0)"
-        let src = "do shell script \"\(cmd)\" with administrator privileges"
+        let value = disabled ? "1" : "0"
+        if run("/usr/bin/sudo", ["-n", "/usr/bin/pmset", "-a", "disablesleep", value]) { return true }
+        return runAsAdmin("/usr/bin/pmset -a disablesleep \(value)")
+    }
+
+    // MARK: Passwordless mode (sudoers rule)
+
+    static let sudoersFile = "/etc/sudoers.d/lidawake"
+
+    static func isPasswordless() -> Bool {
+        FileManager.default.fileExists(atPath: sudoersFile)
+    }
+
+    /// Разрешает без пароля ровно две команды: pmset -a disablesleep 0 и 1.
+    static func installPasswordless() -> Bool {
+        let rule = "\(NSUserName()) ALL=(root) NOPASSWD: "
+            + "/usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1\n"
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("lidawake.sudoers")
+        guard (try? rule.write(to: tmp, atomically: true, encoding: .utf8)) != nil else { return false }
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        // visudo проверяет синтаксис, чтобы битое правило не сломало sudo.
+        return runAsAdmin("/usr/sbin/visudo -cf '\(tmp.path)' && "
+            + "/usr/bin/install -m 0440 -o root -g wheel '\(tmp.path)' \(sudoersFile)")
+    }
+
+    static func removePasswordless() -> Bool {
+        runAsAdmin("/bin/rm -f \(sudoersFile)")
+    }
+
+    // MARK: Helpers
+
+    private static func run(_ path: String, _ args: [String]) -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return false }
+        p.waitUntilExit()
+        return p.terminationStatus == 0
+    }
+
+    private static func runAsAdmin(_ cmd: String) -> Bool {
+        let escaped = cmd.replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let src = "do shell script \"\(escaped)\" with administrator privileges"
         var err: NSDictionary?
         NSAppleScript(source: src)?.executeAndReturnError(&err)
         return err == nil
@@ -105,6 +149,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(off)
 
         menu.addItem(.separator())
+        let pw = NSMenuItem(title: "Не спрашивать пароль", action: #selector(togglePasswordless),
+                            keyEquivalent: "")
+        pw.target = self
+        pw.state = SleepService.isPasswordless() ? .on : .off
+        menu.addItem(pw)
+
+        menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApp.terminate(_:)), keyEquivalent: "q"))
     }
 
@@ -117,6 +168,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func displayOff() { SleepService.displayOffNow() }
+
+    @objc private func togglePasswordless() {
+        let ok = SleepService.isPasswordless()
+            ? SleepService.removePasswordless()
+            : SleepService.installPasswordless()
+        if ok { flash(SleepService.isPasswordless() ? " Без пароля" : " С паролем") }
+    }
 
     private func flash(_ text: String) {
         guard let button = statusItem.button else { return }
